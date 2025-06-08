@@ -10,6 +10,13 @@ from pathlib import Path
 
 import chess  # python-chess for FEN handling and move application
 
+import hashlib
+import time
+import requests
+from urllib.parse import quote_plus
+
+import threading
+
 # ---------------------------
 # Core data structures
 # ---------------------------
@@ -67,21 +74,100 @@ def load_config(path: str | Path | None = None) -> dict[str, float | int]:
     return cfg
 
 # ---------------------------
-# Lichess API stub
+# Lichess Explorer helpers
 # ---------------------------
 
+CACHE_DIR = Path(".cache")
+CACHE_DIR.mkdir(exist_ok=True)
 LICHESS_EXPLORER_URL = "https://explorer.lichess.ovh/masters"
 
-def fetch_moves(fen: str) -> list[dict[str, int | str]]:
-    """Query Lichess Explorer API for moves from a FEN.
-
-    Returns a list of dicts with keys: san, uci, white, draws, black, averageRating.
-    """
-    # TODO: implement HTTP call + simple on-disk cache
-    raise NotImplementedError
+def _cache_path(key: str) -> Path:
+    """Return a filesystem-safe path for this cache key."""
+    digest = hashlib.md5(key.encode()).hexdigest()  # short and opaque
+    return CACHE_DIR / f"{digest}.json"
 
 # ---------------------------
-# Tree construction
+# Robust JSON fetch with rate-limit + cache
+# ---------------------------
+
+_MIN_INTERVAL = 1.5          # seconds between hits to explorer.lichess.ovh
+_MAX_RETRIES  = 3            # on 429
+_BACKOFF_BASE = 2.0          # exponential factor
+
+_last_hit      = 0.0         # monotonic timestamp of last *successful* call
+_lock          = threading.Lock()
+
+def _get_json(url: str, *, ttl: int = 86_400) -> dict:
+    """
+    Fetch URL with on-disk cache **and** polite rate-limit.
+
+    • Waits _MIN_INTERVAL secs between live requests.
+    • Retries on 429 (Too Many Requests) up to _MAX_RETRIES times, with
+      exponential back-off.
+    • Falls back to stale cache (if any) when all retries fail.
+    """
+    global _last_hit
+    path = _cache_path(url)
+
+    # 1) Fresh-cache fast path
+    if path.exists():
+        age = time.time() - path.stat().st_mtime
+        if age < ttl:
+            return json.loads(path.read_text())
+
+    # 2) Live fetch with global rate-limit
+    for attempt in range(_MAX_RETRIES):
+        with _lock:
+            wait = _MIN_INTERVAL - (time.monotonic() - _last_hit)
+            if wait > 0:
+                time.sleep(wait)
+
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 429:
+                raise requests.HTTPError("429 Too Many Requests")
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            # cache and record timestamp
+            path.write_text(json.dumps(data))
+            with _lock:
+                _last_hit = time.monotonic()
+            return data
+
+        except requests.HTTPError as http_exc:
+            if "429" in str(http_exc):
+                # exponential back-off
+                backoff = _BACKOFF_BASE ** attempt
+                time.sleep(backoff)
+                continue  # retry
+            raise  # other HTTP errors propagate
+
+        except Exception as exc:
+            # network error—try stale cache?
+            if path.exists():
+                return json.loads(path.read_text())
+            raise RuntimeError(f"API call failed and no cache: {exc}") from exc
+
+    # 3) Exhausted retries ➜ use stale cache or fail
+    if path.exists():
+        return json.loads(path.read_text())
+    raise RuntimeError("Exceeded rate-limit retries and no cached data.")
+
+# ---------------------------
+# Fetching raw move stats from Lichess Masters explorer
+# ---------------------------
+
+def fetch_moves(fen: str) -> list[dict[str, int | str]]:
+    """Return raw move stats from the Lichess Masters explorer."""
+
+    url  = f"{LICHESS_EXPLORER_URL}?fen={quote_plus(fen)}&moves=50"
+    data = _get_json(url)
+    return data.get("moves", [])
+
+# ---------------------------
+# Tree construction - one ply expansion
 # ---------------------------
 
 def expand(node: Node, cfg: dict) -> None:
@@ -112,7 +198,7 @@ def expand(node: Node, cfg: dict) -> None:
             continue
 
         # compute child FEN by pushing the UCI move
-        board = chess.Board(node.fen if node.fen != "startpos" else None)
+        board = chess.Board(node.fen)
         move  = chess.Move.from_uci(m["uci"])
         board.push(move)
         child_fen = board.fen()
@@ -129,15 +215,40 @@ def expand(node: Node, cfg: dict) -> None:
         node.children[m["uci"]] = (prob, child)
 
 # ---------------------------
-# Evaluation via backward induction
+# Leaf node scoring
 # ---------------------------
 
 def score_terminal(node: Node) -> float:
-    """Compute terminal expectation: +1*P(win) + 0*P(draw) -1*P(loss)."""
-    # TODO: fetch and compute outcome stats for node.fen
-    raise NotImplementedError
+    """
+    +1  if the side-to-move wins
+    −1  if the side-to-move loses
+     0  on draw
+    """
+    fen = node.fen
+    url = f"{LICHESS_EXPLORER_URL}?fen={quote_plus(fen)}&moves=0"
+    stats = _get_json(url)
 
-def evaluate(node: Nodbest_prob, cfg: dict) -> float:
+    wins_white = stats.get("white", 0)
+    wins_black = stats.get("black", 0)
+    draws      = stats.get("draws", 0)
+    total      = wins_white + wins_black + draws
+    if total == 0:
+        return 0.0  # no data
+
+    if node.turn_white:
+        wins  = wins_white
+        loss  = wins_black
+    else:
+        wins  = wins_black
+        loss  = wins_white
+
+    return (wins - loss) / total
+    
+# ---------------------------
+# Evaluation via backward induction
+# ---------------------------
+
+def evaluate(node: Node, cfg: dict) -> float:
     # 1) Expand one ply if not already done and within depth limit
     if not node.children and node.depth < cfg["max_depth"]:
         expand(node, cfg)
@@ -189,7 +300,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Build best-response opening tree.")
     parser.add_argument("--config", type=Path, help="Path to JSON config file")
-    parser.add_argument("--start-fen", default="startpos")
+    parser.add_argument("--start-fen", default=chess.STARTING_FEN)
+    parser.add_argument("--max-depth", default=DEFAULT_CONFIG["max_depth"], type=int, help="Max ply depth to expand")
+    parser.add_argument("--min-reach-probability", default=DEFAULT_CONFIG["min_reach_probability"], type=float, help="Min reach probability to explore a branch")
+    parser.add_argument("--min-games", default=DEFAULT_CONFIG["min_games"], type=int, help="Min games to consider a branch")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
