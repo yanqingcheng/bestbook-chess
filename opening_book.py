@@ -9,6 +9,8 @@ from collections import OrderedDict
 from pathlib import Path
 
 import chess  # python-chess for FEN handling and move application
+from chess import pgn  # PGN export
+import datetime
 
 import hashlib
 import time
@@ -47,6 +49,12 @@ def _report_totals() -> None:
     for d in sorted(DEPTH_HIST):
         print(f" depth {d}: {DEPTH_HIST[d]:,}")
     print("============================\n")
+
+def _reset_counters() -> None:
+    """Zero the node & depth counters for a fresh search."""
+    global NODE_COUNT, DEPTH_HIST
+    NODE_COUNT = 0
+    DEPTH_HIST.clear()
 
 # ---------------------------
 # Core data structures
@@ -204,7 +212,7 @@ def fetch_moves(fen: str) -> list[dict[str, int | str]]:
 # ---------------------------
 
 def expand(node: Node, cfg: dict) -> None:
-    """Grow one ply beneath `node`, pruning on reach_prob."""
+    """Grow one ply beneath node, pruning on reach_prob."""
     if node.depth >= cfg["max_depth"]:
         return
     
@@ -277,20 +285,18 @@ def score_terminal(node: Node) -> float:
     if total == 0:
         return 0.0  # no data
 
-    if node.turn_white:
-        wins  = wins_white
-        loss  = wins_black
-    else:
-        wins  = wins_black
-        loss  = wins_white
+    return 0.0 if total == 0 else (wins_white - wins_black) / total
 
-    return (wins - loss) / total
-    
 # ---------------------------
 # Evaluation via backward induction
 # ---------------------------
 
 def evaluate(node: Node, cfg: dict) -> float:
+    # If this is a brand‐new root search, clear out last run’s counters
+    if node.depth == 0 and node.parent is None:
+        _reset_counters()
+        _bump(0)   # count the root itself
+
     # 1) Expand one ply if not already done and within depth limit
     if not node.children and node.depth < cfg["max_depth"]:
         expand(node, cfg)
@@ -303,10 +309,16 @@ def evaluate(node: Node, cfg: dict) -> float:
     # 3) Otherwise back up values:
     if is_our_move(node, cfg):
         # We choose the child with highest value
-        best_move, (best_prob, best_child) = max(
-            node.children.items(),
-            key=lambda item: evaluate(item[1][1], cfg)
-        )
+        if cfg["book_side"] == "white":
+            best_move, (_, best_child) = max(
+                node.children.items(),
+                key=lambda kv: evaluate(kv[1][1], cfg) 
+            )
+        else:  # black book → minimise
+            best_move, (_, best_child) = min(
+                node.children.items(),
+                key=lambda kv: evaluate(kv[1][1], cfg)
+            )
         node.best_move = best_move
         node.value     = best_child.value
     else:
@@ -321,15 +333,72 @@ def evaluate(node: Node, cfg: dict) -> float:
 # ---------------------------   
 # Utility helpers
 # ---------------------------
-#    
+    
 def is_our_move(node: Node, cfg: dict) -> bool:
     """Return True when the book side gets to choose."""
     return (node.turn_white and cfg["book_side"] == "white") or \
            (not node.turn_white and cfg["book_side"] == "black")
 
+def choose_child(children, cfg):
+    """Return best (move, child) chosen by our side."""
+    if cfg["book_side"] == "white":
+        return max(children.items(), key=lambda kv: kv[1][1].value)
+    else:  # black book → minimise
+        return min(children.items(), key=lambda kv: kv[1][1].value)
+
 # ---------------------------   
 # Output utilities
 # ---------------------------
+
+def tree_to_pgn(root: Node, cfg: dict) -> str:
+    """
+    Build a PGN where:
+      • at our moves: only the chosen move is kept;
+      • at opponent moves: every child is a variation;
+    Recurses depth-first through the built tree.
+    """
+    game = chess.pgn.Game()
+    if root.fen != chess.STARTING_FEN:          # include FEN header for sub-trees
+        game.headers["FEN"] = root.fen
+    board = chess.Board(root.fen)
+
+    def walk(node: Node, pgn_node: chess.pgn.ChildNode) -> None:
+        if not node.children:
+            return
+
+        if is_our_move(node, cfg):
+            mv = node.best_move
+            _, child = node.children[mv]
+            board.push(chess.Move.from_uci(mv))
+            next_pgn = pgn_node.add_variation(board.peek())
+            walk(child, next_pgn)
+            board.pop()
+        else:
+            for mv, (_, child) in node.children.items():
+                board.push(chess.Move.from_uci(mv))
+                var = pgn_node.add_variation(board.peek())
+                walk(child, var)
+                board.pop()
+
+    walk(root, game)
+    exporter = chess.pgn.StringExporter(headers=True, variations=True, comments=False)
+    return game.accept(exporter).strip()
+
+def write_repertoire(root: Node, cfg: dict, *, preview: int = 500) -> None:
+    """
+    • Converts the tree to PGN.
+    • Writes it to a timestamped file in cwd.
+    • Prints the first `preview` chars (truncated with … if longer).
+    """
+    pgn_text = tree_to_pgn(root, cfg)
+    ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = Path(f"repertoire_{cfg['book_side']}_d{cfg['max_depth']}_{ts}.pgn")
+    path.write_text(pgn_text + "\n", encoding="utf-8")
+
+    clip = (pgn_text[:preview] + " …") if len(pgn_text) > preview else pgn_text
+    print("\n--- Repertoire PGN (truncated) ---")
+    print(clip)
+    print(f"\n(full PGN written to {path.resolve()})\n")
 
 def extract_our_lines(root: Node, cfg) -> list[str]:
     """Trace the best-response UCI moves for the book side from the root."""
@@ -374,7 +443,6 @@ if __name__ == "__main__":
     _bump(0) # bump root node count
 
     print()
-    logging.info("Building tree…")
+    logging.info("Building %s book…", cfg["book_side"])
     evaluate(root, cfg)
-    print()
-    logging.info("Main line: %s", extract_our_lines(root))
+    write_repertoire(root, cfg)

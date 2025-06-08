@@ -7,7 +7,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 import json
 import pytest
 import chess
-from opening_book import Node, expand, evaluate, load_config, extract_our_lines, score_terminal
+
+from opening_book import (
+    Node,
+    evaluate,
+    load_config,
+    tree_to_pgn,
+    is_our_move,
+)
 
 # ----------------------------------------------------------------------
 # Dummy API implementations for deterministic testing with real moves
@@ -15,98 +22,79 @@ from opening_book import Node, expand, evaluate, load_config, extract_our_lines,
 
 def dummy_fetch_moves(fen: str) -> list[dict]:
     """
-    Simulate Lichess Explorer data for a depth-2 opening tree using real FENs:
+    3-ply tree with explicit game-counts.
 
-    Start position: generate FEN after initial board setup
-      - 'e2e4' → fen after e2e4
-      - 'd2d4' → fen after d2d4
-
-    From e4 position:
-      - 'c7c5' → fen after e2e4 c7c5
-      - 'e7e5' → fen after e2e4 e7e5
-
-    From d4 position:
-      - 'd7d5' → fen after d2d4 d7d5
-      - 'g8f6' → fen after d2d4 g8f6
-
-    All other FENs return an empty list (leaf nodes).
+       startpos  200 g
+       │
+       ├─ 1. e4            100 g   (58 W  5 D 37 B)
+       │   ├─ … c5          60 g   (54 W  3 D 3 B)
+       │   │    └─ 2.Nf3    60 g   (54 W  3 D 3 B)   leaf
+       │   └─ … e5          40 g   ( 4 W  2 D 34 B)
+       │        └─ 2.Nf3    40 g   ( 4 W  2 D 34 B)  leaf
+       │
+       └─ 1. d4            100 g   (34 W 10 D 56 B)
+           ├─ … d5          60 g   ( 6 W  6 D 48 B)
+           │    └─ 2.c4     60 g   ( 6 W  6 D 48 B)  leaf
+           └─ … Nf6         40 g   (28 W  4 D  8 B)
+                └─ 2.c4     40 g   (28 W  4 D  8 B)  leaf
     """
-    # Build key FENs
-    board = chess.Board()
-    start_fen = board.fen()
-    # e4 and d4
-    board_e4 = chess.Board()
-    board_e4.push_uci('e2e4')
-    e4_fen = board_e4.fen()
-    board_d4 = chess.Board()
-    board_d4.push_uci('d2d4')
-    d4_fen = board_d4.fen()
-    # replies to e4
-    board_e4c5 = chess.Board()
-    board_e4c5.push_uci('e2e4'); board_e4c5.push_uci('c7c5')
-    e4c5_fen = board_e4c5.fen()
-    board_e4e5 = chess.Board()
-    board_e4e5.push_uci('e2e4'); board_e4e5.push_uci('e7e5')
-    e4e5_fen = board_e4e5.fen()
-    # replies to d4
-    board_d4d5 = chess.Board()
-    board_d4d5.push_uci('d2d4'); board_d4d5.push_uci('d7d5')
-    d4d5_fen = board_d4d5.fen()
-    board_d4Nf6 = chess.Board()
-    board_d4Nf6.push_uci('d2d4'); board_d4Nf6.push_uci('g8f6')
-    d4Nf6_fen = board_d4Nf6.fen()
+    def after(ucis):
+        b = chess.Board()
+        for u in ucis:
+            b.push_uci(u)
+        return b.fen()
 
-    data = {
-        start_fen: [
-            {'uci': 'e2e4', 'white': 60, 'draws': 20, 'black': 20, 'fen': e4_fen},
-            {'uci': 'd2d4', 'white': 50, 'draws': 30, 'black': 20, 'fen': d4_fen}
+    # First, all FEN handles
+    start = chess.STARTING_FEN
+    e4, d4 = after(["e2e4"]), after(["d2d4"])
+    e4c5, e4e5 = after(["e2e4", "c7c5"]), after(["e2e4", "e7e5"])
+    d4d5, d4Nf6 = after(["d2d4", "d7d5"]), after(["d2d4", "g8f6"])
+
+    return {
+        start: [
+            dict(uci="e2e4", white=58, draws=5,  black=37),
+            dict(uci="d2d4", white=34, draws=10, black=56),
         ],
-        e4_fen: [
-            {'uci': 'c7c5', 'white': 40, 'draws': 30, 'black': 30, 'fen': e4c5_fen},
-            {'uci': 'e7e5', 'white': 30, 'draws': 40, 'black': 30, 'fen': e4e5_fen}
+        e4: [
+            dict(uci="c7c5", white=54, draws=3, black=3),
+            dict(uci="e7e5", white=4,  draws=2, black=34),
         ],
-        d4_fen: [
-            {'uci': 'd7d5',  'white': 45, 'draws': 25, 'black': 30, 'fen': d4d5_fen},
-            {'uci': 'g8f6','white': 35, 'draws': 35, 'black': 30, 'fen': d4Nf6_fen}
-        ]
-    }
-    return data.get(fen, [])
+        d4: [
+            dict(uci="d7d5", white=6,  draws=6, black=48),
+            dict(uci="g8f6", white=28, draws=4, black=8),
+        ],
+        # leaf ply (only one reply each)
+        e4c5: [dict(uci="g1f3", white=54, draws=3, black=3)],
+        e4e5: [dict(uci="g1f3", white=4,  draws=2, black=34)],
+        d4d5: [dict(uci="c2c4", white=6,  draws=6, black=48)],
+        d4Nf6: [dict(uci="c2c4", white=28, draws=4, black=8)],
+    }.get(fen, [])
 
 
 def dummy_score_terminal(node: Node) -> float:
     """
-    Terminal score expectation at depth limit:
-      +1*P(win) + 0*P(draw) -1*P(loss)
-
-    Recomputes the same FENs as dummy_fetch_moves to build the stats map.
+    Return (P_white – P_black) / total  ⇒  + = good for White.
+    Leaf expectations:
+        e4 c5 Nf3 :  (54-3)/60  = +0.85
+        e4 e5 Nf3 :   (4-34)/40 = –0.75
+        d4 d5 c4  :   (6-48)/60 = –0.70
+        d4 Nf6 c4 :  (28-8)/40  = +0.50
     """
-    # Rebuild the key FENs to match dummy_fetch_moves
-    board_e4c5 = chess.Board()
-    board_e4c5.push_uci('e2e4'); board_e4c5.push_uci('c7c5')
-    e4c5_fen = board_e4c5.fen()
-    board_e4e5 = chess.Board()
-    board_e4e5.push_uci('e2e4'); board_e4e5.push_uci('e7e5')
-    e4e5_fen = board_e4e5.fen()
-    board_d4d5 = chess.Board()
-    board_d4d5.push_uci('d2d4'); board_d4d5.push_uci('d7d5')
-    d4d5_fen = board_d4d5.fen()
-    board_d4Nf6 = chess.Board()
-    board_d4Nf6.push_uci('d2d4'); board_d4Nf6.push_uci('g8f6')
-    d4Nf6_fen = board_d4Nf6.fen()
+    def after(ucis):
+        b = chess.Board()
+        for u in ucis:
+            b.push_uci(u)
+        return b.fen()
 
-    stats_map = {
-        # key: (white, draws, black)
-        e4c5_fen: (40, 30, 30),
-        e4e5_fen: (30, 40, 30),
-        d4d5_fen: (45, 25, 30),
-        d4Nf6_fen: (35, 35, 30),
+    table = {
+        after(["e2e4", "c7c5", "g1f3"]): (54, 3, 3),
+        after(["e2e4", "e7e5", "g1f3"]): (4, 2, 34),
+        after(["d2d4", "d7d5", "c2c4"]): (6, 6, 48),
+        after(["d2d4", "g8f6", "c2c4"]): (28, 4, 8),
     }
-    val = stats_map.get(node.fen)
-    if not val:
-        return 0.0
-    w, d, l = val
+    w, d, l = table.get(node.fen, (0, 0, 0))
     total = w + d + l
-    return (w - l) / total
+    return (w - l) / total if total else 0.0
 
 # ----------------------------------------------------------------------
 # Fixture: patch the real API calls
@@ -142,41 +130,46 @@ def test_load_config_defaults(tmp_path):
     assert cfg2['max_depth'] == 3
 
 
-def test_white_book_picks_best_root_move():
-    """With side=white we expect e4 to outrank d4 under dummy stats."""
-    cfg = base_cfg(side="white")
+def test_white_root_prefers_e4():
+    """Given our skewed leaf values, White must choose 1.e4."""
+    cfg_white = base_cfg(depth=3, side="white")
     root = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0)
-    evaluate(root, cfg)
-    assert root.best_move in {"e2e4", "d2d4"}  # at least not None
+    evaluate(root, cfg_white)
+    assert root.best_move == "e2e4"
 
-
-def test_black_book_stochastic_root():
-    """With side=black the root (White to move) should have no best_move."""
-    cfg = base_cfg(side="black")
+def test_black_book_prefers_e5_and_d5():
+    cfg_b = base_cfg(depth=3, side="black")
     root = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0)
-    evaluate(root, cfg)
-    # book side is black, so root is opponent: best_move stays None
-    assert root.best_move is None
+    evaluate(root, cfg_b)
 
+    e4_reply = root.children["e2e4"][1].best_move
+    d4_reply = root.children["d2d4"][1].best_move
+    assert e4_reply == "e7e5"
+    assert d4_reply == "d7d5"
 
-def test_extract_our_lines_white():
-    """extract_our_lines returns only *our* moves for side=white."""
-    cfg = base_cfg(side="white")
+def test_is_our_move_logic():
+    n_white = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0)
+    n_black = Node(fen=chess.STARTING_FEN, turn_white=False, depth=0)
+    assert is_our_move(n_white, base_cfg(side="white"))
+    assert not is_our_move(n_white, base_cfg(side="black"))
+    assert is_our_move(n_black, base_cfg(side="black"))
+
+def test_tree_to_pgn_white():
     root = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0)
-    evaluate(root, cfg)
-    line = extract_our_lines(root, cfg)
-    assert line  # non-empty
-    assert all(move in {"e2e4", "d2d4"} for move in line)
+    evaluate(root, base_cfg(side="white"))
+    pgn = tree_to_pgn(root, base_cfg(side="white"))
+    # Our repertoire move (e4) must appear as the first token.
+    assert "1. e4" in pgn
 
+def test_tree_to_pgn_black_depth3():
+    cfg_black = base_cfg(depth=3, side="black")
+    root = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0) 
+    evaluate(root, cfg_black)
+    pgn = tree_to_pgn(root, cfg_black)
 
-def test_extract_our_lines_black():
-    """Same helper but for a black repertoire."""
-    cfg = base_cfg(side="black")
-    # set up after 1.e4 so it's Black to move
-    b = chess.Board(); b.push_uci("e2e4")
-    root = Node(fen=b.fen(), turn_white=False, depth=0)
-    evaluate(root, cfg)
-    line = extract_our_lines(root, cfg)
-    # our first choice as Black must be present
-    assert line and line[0] in {"c7c5", "e7e5"}
+    # 1.e4 branch shows both replies for Black and the sole White counter
+    assert "1. e4" in pgn and "1... e5" in pgn and "1... c5" in pgn
+
+    # 1.d4 branch variations present
+    assert "1. d4" in pgn and "1... d5" in pgn and "1... Nf6" in pgn
 
