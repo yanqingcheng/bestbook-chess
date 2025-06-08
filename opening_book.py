@@ -17,9 +17,9 @@ from urllib.parse import quote_plus
 
 import threading
 
-# ------------------------------------------------------------------
+# ---------------------------   
 #  Final counter for each depth
-# ------------------------------------------------------------------
+# ---------------------------   
 from collections import Counter
 import atexit
 
@@ -90,6 +90,7 @@ DEFAULT_CONFIG = {
     "max_depth": 12,                # Ply depth (6 full moves)
     "min_reach_probability": 0.001, # Min probability to explore a branch
     "min_games": 5,                 # Min games to consider a branch
+    "book_side": "white",           # Side to play the book moves (white or black)
 }
 
 def load_config(path: str | Path | None = None) -> dict[str, float | int]:
@@ -218,11 +219,11 @@ def expand(node: Node, cfg: dict) -> None:
         prob  = count / total_games
 
         # compute reach probability under book policy
-        if node.turn_white:
-            # White will play the book move—keep same reach
+        if is_our_move(node, cfg):
+            # We will play the book move—keep same reach
             child_reach = node.reach_prob
         else:
-            # Black replies stochastically
+            # Opponent replies stochastically
             child_reach = node.reach_prob * prob
 
         # prune unlikely-to-be-reached lines
@@ -300,8 +301,8 @@ def evaluate(node: Node, cfg: dict) -> float:
         return node.value
     
     # 3) Otherwise back up values:
-    if node.turn_white:
-        # White chooses the child with highest value
+    if is_our_move(node, cfg):
+        # We choose the child with highest value
         best_move, (best_prob, best_child) = max(
             node.children.items(),
             key=lambda item: evaluate(item[1][1], cfg)
@@ -309,7 +310,7 @@ def evaluate(node: Node, cfg: dict) -> float:
         node.best_move = best_move
         node.value     = best_child.value
     else:
-        # Black is stochastic: expectation over all children
+        # Opponent is stochastic: expectation over all children
         exp_val = 0.0
         for prob, child in node.children.values():
             exp_val += prob * evaluate(child, cfg)
@@ -317,20 +318,35 @@ def evaluate(node: Node, cfg: dict) -> float:
 
     return node.value
 
+# ---------------------------   
+# Utility helpers
 # ---------------------------
+#    
+def is_our_move(node: Node, cfg: dict) -> bool:
+    """Return True when the book side gets to choose."""
+    return (node.turn_white and cfg["book_side"] == "white") or \
+           (not node.turn_white and cfg["book_side"] == "black")
+
+# ---------------------------   
 # Output utilities
 # ---------------------------
 
-def extract_white_lines(root: Node) -> list[str]:
-    """Trace the best-response UCI moves for White from the root."""
-    line: list[str] = []
+def extract_our_lines(root: Node, cfg) -> list[str]:
+    """Trace the best-response UCI moves for the book side from the root."""
+    moves: list[str] = []
     node = root
-    while node.best_move:
-        move = node.best_move
-        line.append(move)
-        _, child = node.children[move]
-        node = child
-    return line
+    while True:
+        # If it's *our* turn and we've chosen a move, record it
+        if is_our_move(node, cfg) and node.best_move:
+            move = node.best_move
+            moves.append(move)
+            _, node = node.children[move]
+        # If it's the opponent's turn and the branch is deterministic
+        elif node.best_move:
+            _, node = node.children[node.best_move]
+        else:
+            break
+    return moves
 
 # ---------------------------
 # CLI entry point
@@ -344,6 +360,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-depth", default=DEFAULT_CONFIG["max_depth"], type=int, help="Max ply depth to expand")
     parser.add_argument("--min-reach-probability", default=DEFAULT_CONFIG["min_reach_probability"], type=float, help="Min reach probability to explore a branch")
     parser.add_argument("--min-games", default=DEFAULT_CONFIG["min_games"], type=int, help="Min games to consider a branch")
+    parser.add_argument("--book-side", choices=["white", "black"], default=DEFAULT_CONFIG["book_side"], help="Side to play the book moves (default: white)")    
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -351,6 +368,7 @@ if __name__ == "__main__":
     cfg["max_depth"] = args.max_depth
     cfg["min_reach_probability"] = args.min_reach_probability
     cfg["min_games"] = args.min_games
+    cfg["book_side"] = args.book_side
 
     root = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0)
     _bump(0) # bump root node count
@@ -359,4 +377,4 @@ if __name__ == "__main__":
     logging.info("Building tree…")
     evaluate(root, cfg)
     print()
-    logging.info("Main line: %s", extract_white_lines(root))
+    logging.info("Main line: %s", extract_our_lines(root))

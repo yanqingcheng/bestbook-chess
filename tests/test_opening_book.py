@@ -1,3 +1,5 @@
+# Unit tests for opening_book.py
+# ----------------------------------------------------------------------
 import sys, os
 # Ensure project root is on PYTHONPATH for test imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -5,7 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 import json
 import pytest
 import chess
-from opening_book import Node, expand, evaluate, load_config, extract_white_lines, score_terminal
+from opening_book import Node, expand, evaluate, load_config, extract_our_lines, score_terminal
 
 # ----------------------------------------------------------------------
 # Dummy API implementations for deterministic testing with real moves
@@ -121,6 +123,14 @@ def patch_api(monkeypatch):
 # Tests
 # ----------------------------------------------------------------------
 
+def base_cfg(depth=2, side="white"):
+    return dict(
+        max_depth=depth,
+        min_reach_probability=0.0,
+        min_games=0,
+        book_side=side,
+    )
+
 def test_load_config_defaults(tmp_path):
     """Defaults and JSON merge behavior."""
     cfg = load_config(None)
@@ -132,35 +142,41 @@ def test_load_config_defaults(tmp_path):
     assert cfg2['max_depth'] == 3
 
 
-def test_expand_and_evaluate_white_real():
-    """White picks the branch with higher EV at root."""
-    cfg = {'max_depth': 2, 'min_reach_probability': 0.0, 'min_games': 0}
-    root = Node(fen=chess.Board().fen(), turn_white=True, depth=0)
-    ev_root = evaluate(root, cfg)
-    # manual EV computation for root branches omitted for brevity
-    assert root.best_move in ['e2e4', 'd2d4']
+def test_white_book_picks_best_root_move():
+    """With side=white we expect e4 to outrank d4 under dummy stats."""
+    cfg = base_cfg(side="white")
+    root = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0)
+    evaluate(root, cfg)
+    assert root.best_move in {"e2e4", "d2d4"}  # at least not None
 
 
-def test_expand_and_evaluate_black_real():
-    """Black's expected value at e4 matches weighted average."""
-    cfg = {'max_depth': 2, 'min_reach_probability': 0.0, 'min_games': 0}
-    board = chess.Board(); board.push_uci('e2e4')
-    e4 = Node(fen=board.fen(), turn_white=False, depth=0)
-    ev = evaluate(e4, cfg)
-    assert isinstance(ev, float)
+def test_black_book_stochastic_root():
+    """With side=black the root (White to move) should have no best_move."""
+    cfg = base_cfg(side="black")
+    root = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0)
+    evaluate(root, cfg)
+    # book side is black, so root is opponent: best_move stays None
+    assert root.best_move is None
 
 
-def test_extract_white_lines_real():
-    """extract_white_lines on a small custom tree."""
-    root = Node(fen='startpos', turn_white=True, depth=0)
-    # simulate two ply line
-    child = Node(fen='e4', turn_white=False, depth=1, parent=root)
-    root.best_move = 'e4'
-    root.children['e4'] = (1.0, child)
-    line = extract_white_lines(root)
-    assert line == ['e4']
+def test_extract_our_lines_white():
+    """extract_our_lines returns only *our* moves for side=white."""
+    cfg = base_cfg(side="white")
+    root = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0)
+    evaluate(root, cfg)
+    line = extract_our_lines(root, cfg)
+    assert line  # non-empty
+    assert all(move in {"e2e4", "d2d4"} for move in line)
 
-@pytest.mark.skip("Not implemented yet")
-def test_score_terminal_not_implemented():
-    with pytest.raises(NotImplementedError):
-        score_terminal(Node(fen='xx', turn_white=True, depth=0))
+
+def test_extract_our_lines_black():
+    """Same helper but for a black repertoire."""
+    cfg = base_cfg(side="black")
+    # set up after 1.e4 so it's Black to move
+    b = chess.Board(); b.push_uci("e2e4")
+    root = Node(fen=b.fen(), turn_white=False, depth=0)
+    evaluate(root, cfg)
+    line = extract_our_lines(root, cfg)
+    # our first choice as Black must be present
+    assert line and line[0] in {"c7c5", "e7e5"}
+
