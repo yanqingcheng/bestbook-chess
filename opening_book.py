@@ -244,6 +244,7 @@ def expand(node: Node, cfg: dict) -> None:
             games      = count,
             reach_prob = child_reach,
         )
+        child._wdl = (m["white"], m["draws"], m["black"])
         node.children[m["uci"]] = (prob, child)
 
         # bump counters for this new node
@@ -259,13 +260,18 @@ def score_terminal(node: Node) -> float:
     −1  if the side-to-move loses
      0  on draw
     """
-    fen = node.fen
-    url = f"{LICHESS_EXPLORER_URL}?fen={quote_plus(fen)}&moves=0"
-    stats = _get_json(url)
+    if hasattr(node, "_wdl"):
+        # we have W/D/L stats saved from expand()
+        wins_white, draws, wins_black = node._wdl
+    else:
+        fen = node.fen
+        url = f"{LICHESS_EXPLORER_URL}?fen={quote_plus(fen)}&moves=0"
+        stats = _get_json(url)
 
-    wins_white = stats.get("white", 0)
-    wins_black = stats.get("black", 0)
-    draws      = stats.get("draws", 0)
+        wins_white = stats.get("white", 0)
+        wins_black = stats.get("black", 0)
+        draws      = stats.get("draws", 0)
+    
     total      = wins_white + wins_black + draws
     if total == 0:
         return 0.0  # no data
