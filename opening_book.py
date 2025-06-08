@@ -17,6 +17,37 @@ from urllib.parse import quote_plus
 
 import threading
 
+# ------------------------------------------------------------------
+#  Final counter for each depth
+# ------------------------------------------------------------------
+from collections import Counter
+import atexit
+
+NODE_COUNT   = 0               # total nodes ever instantiated
+DEPTH_HIST   = Counter()       # depth → count
+REPORT_EVERY = 1               # print every N new nodes
+
+def _bump(depth: int) -> None:
+    """Call this once per new node."""
+    global NODE_COUNT
+    NODE_COUNT  += 1
+    DEPTH_HIST[depth] += 1
+
+    if (NODE_COUNT > 1) and (NODE_COUNT % REPORT_EVERY == 0):
+        live = " ".join(f"{d}:{DEPTH_HIST[d]}" for d in sorted(DEPTH_HIST))
+        print(f"\rnodes {NODE_COUNT:,} | {live}", end="\r", flush=True)
+
+@atexit.register
+def _report_totals() -> None:
+    """Print a summary when the program finishes or is Ctrl-C’d."""
+    if NODE_COUNT == 0:   # nothing ran
+        return
+    print("\n\n=== Opening-book summary ===")
+    print(f"total nodes: {NODE_COUNT:,}")
+    for d in sorted(DEPTH_HIST):
+        print(f" depth {d}: {DEPTH_HIST[d]:,}")
+    print("============================\n")
+
 # ---------------------------
 # Core data structures
 # ---------------------------
@@ -49,6 +80,7 @@ class Node:
     def __repr__(self) -> str:  # pragma: no cover
         mv = f" best={self.best_move}" if self.best_move else ""
         return f"<Node depth={self.depth} value={self.value:.3f}{mv}>"
+
 
 # ---------------------------
 # Configuration helpers
@@ -174,7 +206,7 @@ def expand(node: Node, cfg: dict) -> None:
     """Grow one ply beneath `node`, pruning on reach_prob."""
     if node.depth >= cfg["max_depth"]:
         return
-
+    
     raw_moves = fetch_moves(node.fen)
     # total games at this node
     total_games = sum(m["white"] + m["draws"] + m["black"] for m in raw_moves)
@@ -213,6 +245,9 @@ def expand(node: Node, cfg: dict) -> None:
             reach_prob = child_reach,
         )
         node.children[m["uci"]] = (prob, child)
+
+        # bump counters for this new node
+        _bump(child.depth)
 
 # ---------------------------
 # Leaf node scoring
@@ -257,7 +292,7 @@ def evaluate(node: Node, cfg: dict) -> float:
     if not node.children:
         node.value = score_terminal(node)
         return node.value
-
+    
     # 3) Otherwise back up values:
     if node.turn_white:
         # White chooses the child with highest value
@@ -300,7 +335,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Build best-response opening tree.")
     parser.add_argument("--config", type=Path, help="Path to JSON config file")
-    parser.add_argument("--start-fen", default=chess.STARTING_FEN)
     parser.add_argument("--max-depth", default=DEFAULT_CONFIG["max_depth"], type=int, help="Max ply depth to expand")
     parser.add_argument("--min-reach-probability", default=DEFAULT_CONFIG["min_reach_probability"], type=float, help="Min reach probability to explore a branch")
     parser.add_argument("--min-games", default=DEFAULT_CONFIG["min_games"], type=int, help="Min games to consider a branch")
@@ -308,8 +342,15 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     cfg  = load_config(args.config)
-    root = Node(fen=args.start_fen, turn_white=True, depth=0)
+    cfg["max_depth"] = args.max_depth
+    cfg["min_reach_probability"] = args.min_reach_probability
+    cfg["min_games"] = args.min_games
 
+    root = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0)
+    _bump(0) # bump root node count
+
+    print()
     logging.info("Building tree…")
     evaluate(root, cfg)
+    print()
     logging.info("Main line: %s", extract_white_lines(root))
