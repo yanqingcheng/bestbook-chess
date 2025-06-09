@@ -19,6 +19,8 @@ from urllib.parse import quote_plus
 
 import threading
 
+import argparse, logging
+
 # ---------------------------   
 #  Final counter for each depth
 # ---------------------------   
@@ -27,7 +29,7 @@ import atexit
 
 NODE_COUNT   = 0               # total nodes ever instantiated
 DEPTH_HIST   = Counter()       # depth → count
-REPORT_EVERY = 1               # print every N new nodes
+REPORT_EVERY = 50              # report every N nodes (will be 1 in debug mode)
 
 def _bump(depth: int) -> None:
     """Call this once per new node."""
@@ -66,7 +68,7 @@ class Node:
 
     Attributes:
         fen: FEN string describing the board layout (may repeat across paths)
-        turn_white: True if it’s White to move
+        colour_to_move: chess.WHITE or chess.BLACK
         depth: Ply distance from the root
         parent: Reference to parent Node, or None at root
         children: OrderedDict mapping UCI move string -> (probability, child Node)
@@ -74,21 +76,90 @@ class Node:
         best_move: Chosen move UCI for White, or None for Black nodes
         games: Number of games reaching this position (for future pruning)
         reach_prob: Probability of reaching this position under the book policy
+        wdl: Tuple of (white wins, draws, black wins) for this node, or None if not set
     """
     fen: str
-    turn_white: bool
+    colour_to_move: chess.WHITE | chess.black 
     depth: int
-    parent: Node | None = None
-    children: OrderedDict[str, tuple[float, Node]] = field(default_factory=OrderedDict)
+    parent: "Node" | None = None
+    children: OrderedDict[str, tuple[float, "Node"]] = field(default_factory=OrderedDict)
     value: float = 0.0
     best_move: str | None = None
     games: int = 0
     reach_prob: float = 1.0
+    wdl: tuple[int, int, int] | None = None
 
     def __repr__(self) -> str:  # pragma: no cover
         mv = f" best={self.best_move}" if self.best_move else ""
         return f"<Node depth={self.depth} value={self.value:.3f}{mv}>"
 
+    def maybe_expand(self, cfg: dict) -> None:
+        """Grow one ply beneath node, pruning on reach_prob."""        
+        # sanity check: unless it's the root node, w/d/l stats should be set at this point
+        # and w/d/l stats should sum to games
+        if self.depth > 0:
+            if self.wdl is None:
+                raise ValueError("Node is missing W/D/L stats (wdl=None). This should not happen before expansion.")
+            if self.wdl[0] + self.wdl[1] + self.wdl[2] != self.games:
+                raise ValueError(f"Node games ({self.games}) do not match W/D/L stats {self.wdl}.")
+            
+            # If we have reached any of the pruning limits, do not expand
+            if self.reach_prob < cfg["min_reach_probability"]:
+                logging.debug("Pruning node %s: reach_prob %.3f < min_reach_probability %.3f",
+                            self.fen, self.reach_prob, cfg["min_reach_probability"])
+                return
+            
+            if self.games < cfg["min_games"]:
+                logging.debug("Pruning node %s: games %d < min_games %d",
+                            self.fen, self.games, cfg["min_games"])
+                return
+            
+            if self.depth >= cfg["max_depth"]:
+                logging.debug("Pruning node %s: depth %d >= max_depth %d",
+                            self.fen, self.depth, cfg["max_depth"])
+                return
+              
+        logging.debug("Expanding node %s at depth %d with reach_prob %.3f",
+                      self.fen, self.depth, self.reach_prob)
+        
+        raw_moves = fetch_moves(self.fen)
+        # total games at this node
+        total_games = sum(m["white"] + m["draws"] + m["black"] for m in raw_moves)
+
+        for m in raw_moves:
+            count = m["white"] + m["draws"] + m["black"]
+            prob  = count / total_games
+
+            # compute reach probability under book policy
+            if is_our_move(self, cfg):
+                # We will play the book move—keep same reach
+                child_reach = self.reach_prob
+            else:
+                # Opponent replies stochastically
+                child_reach = self.reach_prob * prob
+
+            # compute child FEN by pushing the UCI move
+            board = chess.Board(self.fen)
+            move  = chess.Move.from_uci(m["uci"])
+            board.push(move)
+            # attach child
+            child = Node(
+                fen        = board.fen(),
+                colour_to_move = not self.colour_to_move,
+                depth      = self.depth + 1,
+                parent     = self,
+                games      = count,
+                reach_prob = child_reach,
+                wdl        = (m["white"], m["draws"], m["black"]),
+            )
+            self.children[m["uci"]] = (prob, child)
+
+            # bump counters for this new node
+            _bump(child.depth)
+        
+        # debug: print list of children for this node
+        logging.debug("Expanded node %s with %d children: %s", 
+                      self.fen, len(self.children), list(self.children.keys()))
 
 # ---------------------------
 # Configuration helpers
@@ -97,7 +168,7 @@ class Node:
 DEFAULT_CONFIG = {
     "max_depth": 12,                # Ply depth (6 full moves)
     "min_reach_probability": 0.001, # Min probability to explore a branch
-    "min_games": 5,                 # Min games to consider a branch
+    "min_games": 10,                # Min games to consider a branch
     "book_side": "white",           # Side to play the book moves (white or black)
 }
 
@@ -208,58 +279,6 @@ def fetch_moves(fen: str) -> list[dict[str, int | str]]:
     return data.get("moves", [])
 
 # ---------------------------
-# Tree construction - one ply expansion
-# ---------------------------
-
-def expand(node: Node, cfg: dict) -> None:
-    """Grow one ply beneath node, pruning on reach_prob."""
-    if node.depth >= cfg["max_depth"]:
-        return
-    
-    raw_moves = fetch_moves(node.fen)
-    # total games at this node
-    total_games = sum(m["white"] + m["draws"] + m["black"] for m in raw_moves)
-    if total_games == 0:
-        return
-
-    for m in raw_moves:
-        count = m["white"] + m["draws"] + m["black"]
-        prob  = count / total_games
-
-        # compute reach probability under book policy
-        if is_our_move(node, cfg):
-            # We will play the book move—keep same reach
-            child_reach = node.reach_prob
-        else:
-            # Opponent replies stochastically
-            child_reach = node.reach_prob * prob
-
-        # prune unlikely-to-be-reached lines
-        if child_reach < cfg["min_reach_probability"] or count < cfg["min_games"]:
-            continue
-
-        # compute child FEN by pushing the UCI move
-        board = chess.Board(node.fen)
-        move  = chess.Move.from_uci(m["uci"])
-        board.push(move)
-        child_fen = board.fen()
-
-        # attach child
-        child = Node(
-            fen        = child_fen,
-            turn_white = not node.turn_white,
-            depth      = node.depth + 1,
-            parent     = node,
-            games      = count,
-            reach_prob = child_reach,
-        )
-        child._wdl = (m["white"], m["draws"], m["black"])
-        node.children[m["uci"]] = (prob, child)
-
-        # bump counters for this new node
-        _bump(child.depth)
-
-# ---------------------------
 # Leaf node scoring
 # ---------------------------
 
@@ -269,21 +288,17 @@ def score_terminal(node: Node) -> float:
     −1  if the side-to-move loses
      0  on draw
     """
-    if hasattr(node, "_wdl"):
-        # we have W/D/L stats saved from expand()
-        wins_white, draws, wins_black = node._wdl
-    else:
-        fen = node.fen
-        url = f"{LICHESS_EXPLORER_URL}?fen={quote_plus(fen)}&moves=0"
-        stats = _get_json(url)
-
-        wins_white = stats.get("white", 0)
-        wins_black = stats.get("black", 0)
-        draws      = stats.get("draws", 0)
+    if node.depth == 0:
+        # Root node should never be scored
+        raise ValueError("Root node should not be scored (depth=0).")
     
-    total      = wins_white + wins_black + draws
-    if total == 0:
-        return 0.0  # no data
+    if node.wdl is not None:
+        # W/D/L stats should always be present at this point
+        wins_white, draws, wins_black = node.wdl
+    else:
+        raise ValueError("Node is missing W/D/L stats (wdl=None). This should not happen after expansion.")
+    
+    total = wins_white + wins_black + draws
 
     return 0.0 if total == 0 else (wins_white - wins_black) / total
 
@@ -293,34 +308,29 @@ def score_terminal(node: Node) -> float:
 
 def evaluate(node: Node, cfg: dict) -> float:
     # If this is a brand‐new root search, clear out last run’s counters
-    if node.depth == 0 and node.parent is None:
+    # Root node check: depth==0 should imply parent is None, and vice versa
+    if node.depth == 0:
+        if node.parent is not None:
+            raise ValueError("Root node has depth 0 but a non-None parent.")
         _reset_counters()
         _bump(0)   # count the root itself
+    elif node.parent is None:
+        raise ValueError("Non-root node has parent=None but depth != 0.")
 
-    # 1) Expand one ply if not already done and within depth limit
-    if not node.children and node.depth < cfg["max_depth"]:
-        expand(node, cfg)
+    # 1) Expand one ply (the expansion handles its own depth check)
+    if not node.children:
+        node.maybe_expand(cfg)
 
     # 2) If leaf, compute its terminal score
     if not node.children:
         node.value = score_terminal(node)
         return node.value
-    
-    # 3) Otherwise back up values:
+
+    # 3) Otherwise, evaluate children and back up values:
     if is_our_move(node, cfg):
-        # We choose the child with highest value
-        if cfg["book_side"] == "white":
-            best_move, (_, best_child) = max(
-                node.children.items(),
-                key=lambda kv: evaluate(kv[1][1], cfg) 
-            )
-        else:  # black book → minimise
-            best_move, (_, best_child) = min(
-                node.children.items(),
-                key=lambda kv: evaluate(kv[1][1], cfg)
-            )
+        best_move, best_value = choose_child(node, cfg)
         node.best_move = best_move
-        node.value     = best_child.value
+        node.value = best_value
     else:
         # Opponent is stochastic: expectation over all children
         exp_val = 0.0
@@ -336,15 +346,23 @@ def evaluate(node: Node, cfg: dict) -> float:
     
 def is_our_move(node: Node, cfg: dict) -> bool:
     """Return True when the book side gets to choose."""
-    return (node.turn_white and cfg["book_side"] == "white") or \
-           (not node.turn_white and cfg["book_side"] == "black")
+    return (node.colour_to_move == chess.WHITE and cfg["book_side"] == "white") or \
+           (node.colour_to_move == chess.BLACK and cfg["book_side"] == "black")
 
-def choose_child(children, cfg):
+def choose_child(node: Node, cfg: dict) -> tuple[str, float]:
     """Return best (move, child) chosen by our side."""
     if cfg["book_side"] == "white":
-        return max(children.items(), key=lambda kv: kv[1][1].value)
+        best_move, (_, best_child) = max(
+            node.children.items(),
+            key=lambda kv: evaluate(kv[1][1], cfg) 
+        )
     else:  # black book → minimise
-        return min(children.items(), key=lambda kv: kv[1][1].value)
+        best_move, (_, best_child) = min(
+            node.children.items(),
+            key=lambda kv: evaluate(kv[1][1], cfg)
+        )
+    return best_move, best_child.value
+        
 
 # ---------------------------   
 # Output utilities
@@ -422,24 +440,30 @@ def extract_our_lines(root: Node, cfg) -> list[str]:
 # ---------------------------
 
 if __name__ == "__main__":
-    import argparse, logging
-
     parser = argparse.ArgumentParser(description="Build best-response opening tree.")
     parser.add_argument("--config", type=Path, help="Path to JSON config file")
-    parser.add_argument("--max-depth", default=DEFAULT_CONFIG["max_depth"], type=int, help="Max ply depth to expand")
-    parser.add_argument("--min-reach-probability", default=DEFAULT_CONFIG["min_reach_probability"], type=float, help="Min reach probability to explore a branch")
-    parser.add_argument("--min-games", default=DEFAULT_CONFIG["min_games"], type=int, help="Min games to consider a branch")
-    parser.add_argument("--book-side", choices=["white", "black"], default=DEFAULT_CONFIG["book_side"], help="Side to play the book moves (default: white)")    
+    parser.add_argument("--max-depth", default=None, type=int, help="Max ply depth to expand")
+    parser.add_argument("--min-reach-probability", default=None, type=float, help="Min reach probability to explore a branch")
+    parser.add_argument("--min-games", default=None, type=int, help="Min games to consider a branch")
+    parser.add_argument("--book-side", choices=["white", "black"], default=None, help="Side to play the book moves (default: white)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")    
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     cfg  = load_config(args.config)
-    cfg["max_depth"] = args.max_depth
-    cfg["min_reach_probability"] = args.min_reach_probability
-    cfg["min_games"] = args.min_games
-    cfg["book_side"] = args.book_side
+    cfg["max_depth"] = args.max_depth if args.max_depth != None else cfg["max_depth"]
+    cfg["min_reach_probability"] = args.min_reach_probability if args.min_reach_probability != None else cfg["min_reach_probability"]
+    cfg["min_games"] = args.min_games if args.min_games != None else cfg["min_games"]
+    cfg["book_side"] = args.book_side if args.book_side != None else cfg["book_side"]
 
-    root = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0)
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        REPORT_EVERY = 1
+    else:
+        logging.getLogger().setLevel(logging.INFO)
+        REPORT_EVERY = 50
+
+    root = Node(fen=chess.STARTING_FEN, colour_to_move=chess.WHITE, depth=0)
     _bump(0) # bump root node count
 
     print()

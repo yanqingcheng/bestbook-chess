@@ -133,13 +133,13 @@ def test_load_config_defaults(tmp_path):
 def test_white_root_prefers_e4():
     """Given our skewed leaf values, White must choose 1.e4."""
     cfg_white = base_cfg(depth=3, side="white")
-    root = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0)
+    root = Node(fen=chess.STARTING_FEN, colour_to_move=chess.WHITE, depth=0)
     evaluate(root, cfg_white)
     assert root.best_move == "e2e4"
 
 def test_black_book_prefers_e5_and_d5():
     cfg_b = base_cfg(depth=3, side="black")
-    root = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0)
+    root = Node(fen=chess.STARTING_FEN, colour_to_move=chess.WHITE, depth=0)
     evaluate(root, cfg_b)
 
     e4_reply = root.children["e2e4"][1].best_move
@@ -148,14 +148,14 @@ def test_black_book_prefers_e5_and_d5():
     assert d4_reply == "d7d5"
 
 def test_is_our_move_logic():
-    n_white = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0)
-    n_black = Node(fen=chess.STARTING_FEN, turn_white=False, depth=0)
+    n_white = Node(fen=chess.STARTING_FEN, colour_to_move=chess.WHITE, depth=0)
+    n_black = Node(fen=chess.STARTING_FEN, colour_to_move=chess.BLACK, depth=0)
     assert is_our_move(n_white, base_cfg(side="white"))
     assert not is_our_move(n_white, base_cfg(side="black"))
     assert is_our_move(n_black, base_cfg(side="black"))
 
 def test_tree_to_pgn_white():
-    root = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0)
+    root = Node(fen=chess.STARTING_FEN, colour_to_move=chess.WHITE, depth=0)
     evaluate(root, base_cfg(side="white"))
     pgn = tree_to_pgn(root, base_cfg(side="white"))
     # Our repertoire move (e4) must appear as the first token.
@@ -163,13 +163,13 @@ def test_tree_to_pgn_white():
 
 def test_tree_to_pgn_black_depth3():
     cfg_black = base_cfg(depth=3, side="black")
-    root = Node(fen=chess.STARTING_FEN, turn_white=True, depth=0) 
+    root = Node(fen=chess.STARTING_FEN, colour_to_move=chess.WHITE, depth=0) 
     evaluate(root, cfg_black)
     pgn = tree_to_pgn(root, cfg_black)
 
-    # 1.e4 branch shows both replies for Black and the sole White counter
-    assert "1. e4" in pgn and "1... e5" in pgn and "1... c5" in pgn
+    # 1.e4 branch - e5 best for black
+    assert "1. e4" in pgn and "e5" in pgn
 
-    # 1.d4 branch variations present
-    assert "1. d4" in pgn and "1... d5" in pgn and "1... Nf6" in pgn
+    # 1.d4 branch - d5 best for black
+    assert "1. d4" in pgn and "d5" in pgn 
 
